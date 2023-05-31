@@ -13,3 +13,9 @@ Requirements
 
 * Python 3.10+
 * This needs module audioop but it appears to be deprecated/removed in Python 3.13 - https://docs.python.org/3/library/audioop.html
+
+
+Credits 
+PyRTP - RTP Header generation 
+https://gitlab.com/nickvsnetworking/pyrtp 
+
