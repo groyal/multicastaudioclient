@@ -2,10 +2,6 @@ import codecs
 import queue
 import random
 import sys
-import subprocess
-import wave
-import numpy
-import websocket
 import socket
 import struct
 import json
@@ -13,15 +9,11 @@ import time
 import logging
 import pyaudio
 from numpy import asarray, frombuffer, array, repeat, short, float32
-import opuslib
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 from Crypto.Hash import SHA256
-import base64
 from threading import Thread,Lock
-import traceback
 import os
-import librosa
 import audioop
 import pyrtp
 import sox
@@ -30,7 +22,7 @@ from copy import deepcopy
 from scipy.io import wavfile
 
 logging.basicConfig(format='%(asctime)s %(levelname).1s %(funcName)s: %(message)s', level=logging.INFO)
-LOG = logging.getLogger('Zellostream')
+LOG = logging.getLogger('multicastclient')
 
 if os.name != 'nt':  #'nt' is Windows
 	from pulseaudio import PulseAudioHandler
@@ -45,8 +37,7 @@ current_working_directory = os.getcwd()
 AudioEncodingLINEAR16 = 1
 AudioEncodingMULAW = 2
 
-filename = "soundsample.wav"
-frames = []
+udp_buffer_lock = Lock()
 
 class ConfigException(Exception):
 	pass
@@ -66,7 +57,8 @@ def get_config():
 	config["output_pulse_name"] = configdata.get("output_pulse_name")
 
 	# sample rate for microphone and for speakers 
-	config["audio_sample_rate"] = configdata.get("audio_sample_rate", 16000)
+	config["audio_sample_rate_source"] = configdata.get("audio_sample_rate_source", 16000)
+	config["audio_sample_rate_sink"] = configdata.get("audio_sample_rate_sink", 8000)
 	config["audio_channels"] = configdata.get("audio_channels", 1)
 	config["audio_bits"] = configdata.get("audio_bits", 16)
 	config["audio_encoding"] = configdata.get("audio_encoding", "signed-integer")
@@ -111,7 +103,7 @@ def get_default_output_audio_index(config, p):
 #	16bit, 16000, Linear PCM 
 #
 def start_audio(config, p):
-	audio_chunk = int(config["audio_sample_rate"] * SECONDS)  # 20ms = 960 samples @ 16000 S/s
+	audio_chunk = int(config["audio_sample_rate_source"] * SECONDS)  # 20ms = 960 samples @ 16000 S/s
 	format = pyaudio.paInt16  #16bit signed integer
 	LOG.debug("open audio")
 
@@ -128,7 +120,7 @@ def start_audio(config, p):
 	input_stream = p.open(
 		format=format,
 		channels=config["audio_channels"],
-		rate=config["audio_sample_rate"],
+		rate=config["audio_sample_rate_source"],
 		input=True,
 		frames_per_buffer=audio_chunk,
 		input_device_index=input_device_index,
@@ -165,11 +157,11 @@ def start_audio(config, p):
 	
 	output_stream = p.open(
 		format=format,
-		channels=config["audio_channels"],
-		rate=config["audio_sample_rate"],
+		channels=1,
+		rate=config["audio_sample_rate_sink"],
 		output=True,
-		frames_per_buffer=1024,
-		output_device_index=output_device_index,
+		frames_per_buffer=4096,
+		output_device_index=output_device_index
 	)
 	"""
 	if config["output_pulse_name"] != None and os.name != 'nt': 
@@ -203,7 +195,7 @@ def start_audio(config, p):
 #
 def record_chunk(config, stream, channel="mono"):
 
-	audio_chunk = int(config["audio_sample_rate"] * SECONDS)
+	audio_chunk = int(config["audio_sample_rate_source"] * SECONDS)
 
 	alldata = bytearray()
 	data = stream.read(audio_chunk)
@@ -224,76 +216,35 @@ def record_chunk(config, stream, channel="mono"):
 #	This runs on another thread and when traffic appears place onto updata variable 
 #	Note we need to use the same ssrc for each session to make sure we dont pickup multicast originated from here
 #
-def udp_mcast_rx(sock,config, ssrc):
+def udp_mcast_rx(sock,config, ssrc, audio_output_stream, seconds):
 	global udpdata_rx, udp_buffer_lock
 	ssrc_1 = hex(ssrc)[2:]
 
-	print("Start UDP multicast recieve with ", ssrc)
+	num_bytes = 640
 
 	while processing:
 		try:
 			newdata = sock.recv(1024)
-			#print("new data = " + str(len(newdata)))
 			# find SSRC and check if it the same as mcast TX so can ignore
 			in_ssrc = hex(newdata[8])[2:] + hex(newdata[9])[2:] + hex(newdata[10])[2:] + hex(newdata[11])[2:]
 			# this is to make sure we dont pick up multicast traffic we sent 
-			
 			if (not ssrc == int(in_ssrc, 16)):
 				# trim out the header 
+
 				newdata = newdata[12:]
-				#mcast_2_audio_queue.put(newdata)
 				with udp_buffer_lock:
 					udpdata_rx = udpdata_rx + newdata
+					data = frombuffer(udpdata_rx[:num_bytes], dtype=short)
+					if len(data) == num_bytes/2:
+						udpdata_rx = udpdata[num_bytes:]
+						# for some reason sox conversion fails, but ulaw2lin works fine. 
+						#datax = tfm_rx.build_array(input_array=data, sample_rate_in=8000)
+						datax = audioop.ulaw2lin(data, 2)
+						audio_output_stream.write(datax)
+
 		except socket.timeout:
 			pass
-###########################  MONITOR QUEUE AUDIO TO OUTPUT #####################################################
-#
-#	This runs on thread and waits for traffic on mcast_2_audio_queue
-#	once sees traffic - converts to PCM signed integer and passes to audio output
-def mcast_queue_to_audio(tfm_rx, audio_output_stream,seconds, config ):
-	global udpdata_rx ,udp_buffer_lock
-	# check if there is data in themcast_2_audio_queue
-	packetps = int(1000 / (seconds * 1000))
-	print("packets per second = " + str(packetps))
-	num_bytes = (packetps * 160) 
-	print("number of bytes to get " + str(num_bytes))
-	
-	while processing: 
 
-		# we need aud
-		if ( len(udpdata_rx) > num_bytes):
-			#"there is enough in queue to get 1 second data")
-			with udp_buffer_lock: 
-				data = frombuffer(udpdata_rx[:num_bytes], dtype=short)
-				if len(data) == num_bytes/2:
-					udpdata_rx = udpdata[num_bytes:]
-
-				datax = tfm_rx.build_array(input_array=data, sample_rate_in=8000)
-				audio_output_stream.write(datax.astype(short))
-
-############################################### AUDIO INPUT FROM MCAST ###########################################
-#	Recieves the inbound data from mcast address as udp_buffer_lock 
-#	This buffer is converted if necessary to the correct sample rate. 
-#
-"""
-def get_udp_audio_mcast_rx(config,seconds):
-	global udpdata_rx ,udp_buffer_lock
-
-	rtp_header_size = 12
-	# the number of bytes to get are seconds * sample rate 
-	#.02 seconds * 8000 samples per second  = 160 bytes (however check for RTP header of 12 bytes)
-	num_bytes = int((seconds*config["audio_mcast_sample_rate"]) + rtp_header_size)
-	with udp_buffer_lock: 
-		data = frombuffer(udpdata[:num_bytes], dtype=short)
-		if len(data) == num_bytes/2:
-			updata_rx = udpdata[num_bytes:]
-		else:
-			data = numpy.empty(0, dtype=short)
-
-	# data2 is returned at a sample rate of 8000 1 channel ulaw - it is raw data
-	# however it is returned as shorts so 2 bytes per short 
-	return data
-"""
 ########################### SEND AUDIO OUT TO MCAST #############################################################
 #
 #	This thread waits for activity on the Queue. It is set SECONDS apart. 
@@ -321,13 +272,15 @@ def send_mcast_from_queue(UDPSender, mgrp, SECONDS, config, ssrc):
 			header_hex = pyrtp.GenerateRTPpacket(packet_vars)
 			UDPSender.sendto(bytes.fromhex(header_hex), mgrp)
 			time.sleep(SECONDS)
+
+
 ##################################################################################################################
 #
-#	The primary source is the Local audio. It 
+#	The primary source is the Local audio Microphone -
 #
 #
 def main():
-	global udpdata, udpdata_rx, processing,udp_buffer_lock, mcast_sender_queue, mcast_2_audio_queue
+	global udpdata, udpdata_rx, processing,udp_buffer_lock, mcast_sender_queue, tfm_rx
 
 	stream_id = None
 	processing = True
@@ -372,9 +325,8 @@ def main():
 	mreq = struct.pack('=4s4s', socket.inet_aton(config["mcast_address"]), socket.inet_aton(config["audio_mcast_interface_address"]))
 	UDPSock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-	udp_rx_thread = Thread(target=udp_mcast_rx,args=(UDPSock,config, ssrc))
+	udp_rx_thread = Thread(target=udp_mcast_rx,args=(UDPSock,config, ssrc, audio_output_stream, SECONDS))
 	udp_rx_thread.start()
-	udp_buffer_lock = Lock()
 
 	#
 	# CREATE SENDER MULTICAST 
@@ -382,13 +334,16 @@ def main():
 	# This defines a multicast end point, that is a pair
     #   (multicast group ip address, send-to port nubmer)
 	# 
-	UDPSender = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP, fileno=None)
-	mcast_sender_queue = queue.Queue()
-	mcast_2_audio_queue = queue.Queue()
 	mgrp = (config["mcast_address"] ,config["mcast_port"])
+	mcast_sender_queue = queue.Queue()
+	
+	UDPSender = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP, fileno=None)
 	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
 	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(config["audio_mcast_interface_address"]))
-	udp_tx_thread = Thread(target=send_mcast_from_queue,args=(UDPSender,mgrp, SECONDS, config, ssrc))
+	
+
+	# changed it here UDPSender -> UDPSock 
+	udp_tx_thread = Thread(target=send_mcast_from_queue,args=(UDPSock, mgrp, SECONDS, config, ssrc))
 	udp_tx_thread.start()
 	udp_tx_buffer_lock = Lock()
 
@@ -399,22 +354,12 @@ def main():
 	packets = 3
 
 	tfm_tx = sox.Transformer()
-	tfm_tx.set_input_format(channels=config["audio_channels"], bits=config["audio_bits"], rate=config['audio_sample_rate'], file_type='s16')
+	tfm_tx.set_input_format(channels=config["audio_channels"], bits=config["audio_bits"], rate=config['audio_sample_rate_source'], file_type='s16')
 	if ( config["audio_mcast_encoding"] == "u-law" ):
 		tfm_tx.set_output_format(rate=8000, bits=8, channels=1, encoding="u-law" )
 	elif ( config["audio_mcast_encoding"] == "a-law" ):
 		tfm_tx.set_output_format(rate=8000, bits=8, channels=1, encoding="a-law" )
 
-	tfm_rx = sox.Transformer()
-	if ( config["audio_mcast_encoding"] == "u-law" ):
-		tfm_rx.set_input_format(channels=1, bits=8, encoding="u-law", file_type="ul" )
-	elif ( config["audio_mcast_encoding"] == "a-law" ):
-		tfm_rx.set_input_format(channels=1, bits=8, encoding="a-law", file_type="al")
-		
-	tfm_rx.set_output_format(rate=config['audio_sample_rate'], bits=config["audio_bits"], channels=config["audio_channels"], file_type='s16', encoding='signed-integer')
-
-	audio_thread = Thread(target=mcast_queue_to_audio, args=(tfm_rx, audio_output_stream, SECONDS, config ))
-	audio_thread.start()
 	print("Finished Initial processing ")
 	#
 	#		Loop Through looking for audio from microphone 
@@ -435,6 +380,8 @@ def main():
 				has_data = True
 			else:
 				max_audio_level = 0
+				has_data = False
+				
 			# if we have data and the max level is exceeded then 
 			if has_data and max_audio_level > config["audio_threshold"]: 
 				
@@ -446,7 +393,7 @@ def main():
 
 					# this is signed 16bit linear PCM - needs to be 8bit unsigned PCMU
 
-					datax = tfm_tx.build_array(input_array=data, sample_rate_in=config["audio_sample_rate"])
+					datax = tfm_tx.build_array(input_array=data, sample_rate_in=config["audio_sample_rate_source"])
 					
 					# sample_rate = 8000, bits = 8, channels = 1, encoding = u-law
 					data4 = codecs.encode(datax, "hex").decode()
@@ -473,14 +420,6 @@ def main():
 
 	LOG.info("terminating")
 
-	"""
-	print("finish up recordings")
-	file = open("samplesound.wav", "wb")
-	for j in frames:
-		file.write(j)
-	file.close()	
-	print("----")
-	"""
 	audio_input_stream.close()
 	audio_output_stream.close()
 	p.terminate()
