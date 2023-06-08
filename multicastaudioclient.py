@@ -341,7 +341,6 @@ def main():
 	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
 	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(config["audio_mcast_interface_address"]))
 	
-
 	# changed it here UDPSender -> UDPSock 
 	udp_tx_thread = Thread(target=send_mcast_from_queue,args=(UDPSock, mgrp, SECONDS, config, ssrc))
 	udp_tx_thread.start()
@@ -428,4 +427,5 @@ def main():
 	UDPSender.close()
 
 if __name__ == "__main__":
+
 	main()
