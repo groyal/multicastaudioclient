@@ -389,6 +389,8 @@ def main():
 					# this is signed 16bit linear PCM - needs to be 8bit unsigned PCMU
 
 					datax = tfm_tx.build_array(input_array=data, sample_rate_in=config["audio_sample_rate_source"])
+					#datax = audioop.lin2ulaw(data, 2)
+					#datax = audioop.bias(datax, 1, 128)
 					
 					# sample_rate = 8000, bits = 8, channels = 1, encoding = u-law
 					data4 = codecs.encode(datax, "hex").decode()

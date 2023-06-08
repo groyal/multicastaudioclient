@@ -14,6 +14,9 @@ Requirements
 * Python 3.10+
 * This needs module audioop but it appears to be deprecated/removed in Python 3.13 - https://docs.python.org/3/library/audioop.html
 
+Audioop has lin2ulaw and ulaw2lin. For some reason I was unable to get lin2law working reliably so switch to pysox. 
+But on inbound sox (ulaw -> lin) didnt work reliably but ulaw2lin worked fine. 
+
 
 Credits 
 PyRTP - RTP Header generation 
