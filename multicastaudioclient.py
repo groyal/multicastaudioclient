@@ -1,6 +1,9 @@
 import codecs
+import queue
+import random
 import sys
 import subprocess
+import wave
 import numpy
 import websocket
 import socket
@@ -21,6 +24,10 @@ import os
 import librosa
 import audioop
 import pyrtp
+import sox
+from rtp import RTP, Extension, PayloadType
+from copy import deepcopy
+from scipy.io import wavfile
 
 logging.basicConfig(format='%(asctime)s %(levelname).1s %(funcName)s: %(message)s', level=logging.INFO)
 LOG = logging.getLogger('Zellostream')
@@ -30,10 +37,16 @@ if os.name != 'nt':  #'nt' is Windows
 
 seq_num = 0
 
+# this is milliseconds 
 SECONDS = 0.02
 
 # get the current working directory
 current_working_directory = os.getcwd()
+AudioEncodingLINEAR16 = 1
+AudioEncodingMULAW = 2
+
+filename = "soundsample.wav"
+frames = []
 
 class ConfigException(Exception):
 	pass
@@ -44,24 +57,31 @@ def get_config():
 	with open(current_working_directory + "/config.json") as f:
 		configdata = json.load(f)
 
-	config["vox_silence_time"] = configdata.get("vox_silence_time", 3)
+	config["vox_silence_time"] = configdata.get("vox_silence_time", 5)
 	config["audio_threshold"] = configdata.get("audio_threshold", 1000)
+	# these are the pulse devices for the audio 
 	config["input_device_index"] = configdata.get("input_device_index", 0)
 	config["input_pulse_name"] = configdata.get("input_pulse_name")
 	config["output_device_index"] = configdata.get("output_device_index", 0)
 	config["output_pulse_name"] = configdata.get("output_pulse_name")
-	config["audio_input_sample_rate"] = configdata.get("audio_input_sample_rate", 48000)
-	config["audio_input_channels"] = configdata.get("audio_input_channels", 1)
-	config["zello_sample_rate"] = configdata.get("zello_sample_rate", 16000)
-	config["audio_output_sample_rate"] = configdata.get("audio_output_sample_rate", 48000)
-	config["audio_output_channels"] = configdata.get("audio_output_channels", 1)
-	config["audio_output_volume"] = configdata.get("audio_output_volume", 1)
-	config["in_channel_config"] = configdata.get("in_channel", "mono")
-	config["audio_source"] = configdata.get("audio_source","Sound Card")
-	config["logging_level"] = configdata.get("logging_level", "warning")
-	config["udp_port"] = configdata.get("UDP_PORT",9123)
+
+	# sample rate for microphone and for speakers 
+	config["audio_sample_rate"] = configdata.get("audio_sample_rate", 16000)
+	config["audio_channels"] = configdata.get("audio_channels", 1)
+	config["audio_bits"] = configdata.get("audio_bits", 16)
+	config["audio_encoding"] = configdata.get("audio_encoding", "signed-integer")
+
+	# sample rate for multicast - currently just u-law / a-law
+	config["audio_mcast_encoding"] = configdata.get("audio_mcast_encoding", "u-law")
+	config["audio_mcast_sample_rate"] = configdata.get("audio_mcast_sample_rate", 8000)
 	config["mcast_address"] = configdata.get("mcast_address", "239.10.10.10")
 	config["mcast_port"] = configdata.get("mcast_port", 10000)
+	config["audio_mcast_interface_address"] = configdata.get("audio_mcast_interface_address", "any")
+
+	config["in_channel_config"] = configdata.get("in_channel", "mono")
+
+	config["logging_level"] = configdata.get("logging_level", "warning")
+
 	return config
 
 
@@ -86,9 +106,13 @@ def get_default_output_audio_index(config, p):
 			input_device_names[device_info["name"]] = device_info["index"]
 	return input_device_names.get("default", config["input_device_index"])
 
+#
+# 	Returns Audio stream from and to microphone/speaker 
+#	16bit, 16000, Linear PCM 
+#
 def start_audio(config, p):
-	audio_chunk = int(config["audio_input_sample_rate"] * SECONDS)  # 60ms = 960 samples @ 16000 S/s
-	format = pyaudio.paInt16
+	audio_chunk = int(config["audio_sample_rate"] * SECONDS)  # 20ms = 960 samples @ 16000 S/s
+	format = pyaudio.paInt16  #16bit signed integer
 	LOG.debug("open audio")
 
 	if (config["input_pulse_name"] != None or config["output_pulse_name"] != None) and os.name != 'nt': # using pulseaudio
@@ -103,8 +127,8 @@ def start_audio(config, p):
 
 	input_stream = p.open(
 		format=format,
-		channels=config["audio_input_channels"],
-		rate=config["audio_input_sample_rate"],
+		channels=config["audio_channels"],
+		rate=config["audio_sample_rate"],
 		input=True,
 		frames_per_buffer=audio_chunk,
 		input_device_index=input_device_index,
@@ -135,18 +159,20 @@ def start_audio(config, p):
 	# Audio outpput
 	if config["output_pulse_name"] != None and os.name != 'nt': # using pulseaudio for output
 		output_device_index = get_default_output_audio_index(config, p)
+
 	else: # use pyaudio device number
 		output_device_index = config["output_device_index"]
+	
 	output_stream = p.open(
 		format=format,
-		channels=config["audio_output_channels"],
-		rate=config["audio_output_sample_rate"],
+		channels=config["audio_channels"],
+		rate=config["audio_sample_rate"],
 		output=True,
-		frames_per_buffer=audio_chunk,
+		frames_per_buffer=1024,
 		output_device_index=output_device_index,
 	)
-	LOG.debug("audio output opened")
-	if config["output_pulse_name"] != None and os.name != 'nt': # redirect output from zellostream with pulseaudio
+	"""
+	if config["output_pulse_name"] != None and os.name != 'nt': 
 		LOG.error("output_pulse_name is %s",config["output_pulse_name"])
 		pulse_sink_index = pulse.get_sink_index(config["output_pulse_name"])
 		pulse_sink_input_index = pulse.get_own_sink_input_index()
@@ -166,17 +192,19 @@ def start_audio(config, p):
 				)
 			except Exception as ex:
 				LOG.error("exception assigning pulseaudio sink: %s", ex)
+	"""
+
 	return input_stream, output_stream
 
 #
 #	Try and get data from the input stream at the configured sample_rate (usually 16K)
 #	This will be linear PCM 16bit 
-#	we need to convert this to PCMU 8bit 8K 
-#	Return bytes in linear PCM
+#	Return bytes in linear PCM with 160 bytes 20ms 
 #
 def record_chunk(config, stream, channel="mono"):
 
-	audio_chunk = int(config["audio_input_sample_rate"] * SECONDS)
+	audio_chunk = int(config["audio_sample_rate"] * SECONDS)
+
 	alldata = bytearray()
 	data = stream.read(audio_chunk)
 	alldata.extend(data)
@@ -190,63 +218,123 @@ def record_chunk(config, stream, channel="mono"):
 	elif channel == "mix":
 		z_data = (z_data[0::2] + z_data[1::2]) / 2
 
-	#return z_data
-	return data
+	return z_data
 
-#
+############################### MONITOR FOR INBOUND MCAST AND PLACE IN QUEUE ####################################
 #	This runs on another thread and when traffic appears place onto updata variable 
+#	Note we need to use the same ssrc for each session to make sure we dont pickup multicast originated from here
 #
-def udp_mcast_rx(sock,config):
-	global udpdata
-	print("Start UDP multicast recieve")
+def udp_mcast_rx(sock,config, ssrc):
+	global udpdata_rx, udp_buffer_lock
+	ssrc_1 = hex(ssrc)[2:]
+
+	print("Start UDP multicast recieve with ", ssrc)
+
 	while processing:
 		try:
-			newdata = sock.recv(4096)
-			#LOG.debug("got %d bytes ", len(newdata))
-			with udp_buffer_lock:
-				udpdata = udpdata + newdata
+			newdata = sock.recv(1024)
+			#print("new data = " + str(len(newdata)))
+			# find SSRC and check if it the same as mcast TX so can ignore
+			in_ssrc = hex(newdata[8])[2:] + hex(newdata[9])[2:] + hex(newdata[10])[2:] + hex(newdata[11])[2:]
+			# this is to make sure we dont pick up multicast traffic we sent 
+			
+			if (not ssrc == int(in_ssrc, 16)):
+				# trim out the header 
+				newdata = newdata[12:]
+				#mcast_2_audio_queue.put(newdata)
+				with udp_buffer_lock:
+					udpdata_rx = udpdata_rx + newdata
 		except socket.timeout:
 			pass
-
+###########################  MONITOR QUEUE AUDIO TO OUTPUT #####################################################
 #
+#	This runs on thread and waits for traffic on mcast_2_audio_queue
+#	once sees traffic - converts to PCM signed integer and passes to audio output
+def mcast_queue_to_audio(tfm_rx, audio_output_stream,seconds, config ):
+	global udpdata_rx ,udp_buffer_lock
+	# check if there is data in themcast_2_audio_queue
+	packetps = int(1000 / (seconds * 1000))
+	print("packets per second = " + str(packetps))
+	num_bytes = (packetps * 160) 
+	print("number of bytes to get " + str(num_bytes))
+	
+	while processing: 
+
+		# we need aud
+		if ( len(udpdata_rx) > num_bytes):
+			#"there is enough in queue to get 1 second data")
+			with udp_buffer_lock: 
+				data = frombuffer(udpdata_rx[:num_bytes], dtype=short)
+				if len(data) == num_bytes/2:
+					udpdata_rx = udpdata[num_bytes:]
+
+				datax = tfm_rx.build_array(input_array=data, sample_rate_in=8000)
+				audio_output_stream.write(datax.astype(short))
+
+############################################### AUDIO INPUT FROM MCAST ###########################################
 #	Recieves the inbound data from mcast address as udp_buffer_lock 
 #	This buffer is converted if necessary to the correct sample rate. 
 #
-def get_udp_audio_mcast(config,seconds):
-	global udpdata,udp_buffer_lock
+"""
+def get_udp_audio_mcast_rx(config,seconds):
+	global udpdata_rx ,udp_buffer_lock
 
-	# the number of bytes to get are seconds * sample rate * 2 
-	num_bytes = int(seconds*config["audio_input_sample_rate"]*2)  #.06 seconds * 8000 samples per second * 2 bytes per sample => 960 bytes per 60 ms
-
+	rtp_header_size = 12
+	# the number of bytes to get are seconds * sample rate 
+	#.02 seconds * 8000 samples per second  = 160 bytes (however check for RTP header of 12 bytes)
+	num_bytes = int((seconds*config["audio_mcast_sample_rate"]) + rtp_header_size)
 	with udp_buffer_lock: 
-		#print(udpdata[:num_bytes])
 		data = frombuffer(udpdata[:num_bytes], dtype=short)
 		if len(data) == num_bytes/2:
-			udpdata = udpdata[num_bytes:]
-			#print("MCAST getting audio udpdata length is ",len(udpdata))
+			updata_rx = udpdata[num_bytes:]
 		else:
 			data = numpy.empty(0, dtype=short)
 
-	#this converts ulaw to 16bit linear PCM 
-	data2 = audioop.ulaw2lin(data,2)
-	# now convert from 8000 to 16000 
-	data2 = audioop.ratecv(data2, 2, 1, 8000, 16000, None)[0]
-		
-	# data2 is returned at a sample rate of 16000 PCM linear, default zello sample rate 
-	return data2
+	# data2 is returned at a sample rate of 8000 1 channel ulaw - it is raw data
+	# however it is returned as shorts so 2 bytes per short 
+	return data
+"""
+########################### SEND AUDIO OUT TO MCAST #############################################################
+#
+#	This thread waits for activity on the Queue. It is set SECONDS apart. 
+# 	Once data turns up on the queue, it forwards it out the UDPSender socket to mgrp	
+#
+#
+def send_mcast_from_queue(UDPSender, mgrp, SECONDS, config, ssrc):
+	#check if data in queue 
+	print("send mcast from queue started")
+	sequence_number = 0
+	time_int = random.randint(1,9999)
+	# samplingrate / packets per second 0000 / 50 = 160
+	incrementts = int(config["audio_mcast_sample_rate"] * SECONDS)
+	#incrementts = 160
 
-def bytes_to_uint32(bytes):
-	return bytes[0]*(1<<24) + bytes[1]*(1<<16) + bytes[2]*(1<<8) + bytes[3]
+	while True:
+		#if data in queue then send it 
+		if (mcast_sender_queue.qsize() > 0):
+			dpacket = mcast_sender_queue.get()
+			
+			time_int = time_int + incrementts
+			sequence_number = sequence_number + 1
 
+			packet_vars = {'version' : 2, 'padding' : 0, 'extension' : 0, 'csi_count' : 0, 'marker' : 1, 'payload_type' : 0, 'sequence_number' : sequence_number, 'timestamp' : time_int, 'ssrc' : ssrc, 'payload' :  dpacket }
+			header_hex = pyrtp.GenerateRTPpacket(packet_vars)
+			UDPSender.sendto(bytes.fromhex(header_hex), mgrp)
+			time.sleep(SECONDS)
+##################################################################################################################
 #
 #	The primary source is the Local audio. It 
 #
 #
 def main():
-	global udpdata,processing,udp_buffer_lock
+	global udpdata, udpdata_rx, processing,udp_buffer_lock, mcast_sender_queue, mcast_2_audio_queue
+
 	stream_id = None
 	processing = True
 	udpdata = b''
+	udpdata_rx = b''
+
+	ssrc = random.randint(200000, 999999)
 
 	try:
 		config = get_config()
@@ -263,12 +351,14 @@ def main():
 	#	
 	#	Multicast - setup multicast reciever on thread 
 	#
-	print("Audio Source is " + config["audio_source"] )
 
 	LOG.debug("start PyAudio")
 	p = pyaudio.PyAudio()
 	LOG.debug("started PyAudio")
 	audio_input_stream, audio_output_stream = start_audio(config, p)
+
+	#fs, dm = wavfile.read('PinkPanther.wav')
+	#audio_output_stream.write(dm)
 
 	#
 	# multicast RX
@@ -278,33 +368,54 @@ def main():
 	UDPSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 	listen_addr = (config["mcast_address"] ,config["mcast_port"])
 	UDPSock.bind(listen_addr)
-	#mreq = struct.pack("4sl", socket.inet_aton(config["mcast_address"]), socket.INADDR_ANY)
-	mreq = struct.pack('=4s4s', socket.inet_aton(config["mcast_address"]), socket.inet_aton("192.168.151.122"))
+
+	mreq = struct.pack('=4s4s', socket.inet_aton(config["mcast_address"]), socket.inet_aton(config["audio_mcast_interface_address"]))
 	UDPSock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-	udp_rx_thread = Thread(target=udp_mcast_rx,args=(UDPSock,config))
+	udp_rx_thread = Thread(target=udp_mcast_rx,args=(UDPSock,config, ssrc))
 	udp_rx_thread.start()
 	udp_buffer_lock = Lock()
 
 	#
 	# CREATE SENDER MULTICAST 
 	#
-	UDPSender = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP, fileno=None)
 	# This defines a multicast end point, that is a pair
     #   (multicast group ip address, send-to port nubmer)
 	# 
+	UDPSender = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP, fileno=None)
+	mcast_sender_queue = queue.Queue()
+	mcast_2_audio_queue = queue.Queue()
 	mgrp = (config["mcast_address"] ,config["mcast_port"])
 	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton("192.168.151.122"))
-	# Transmit the datagram in the buffer
-	#UDPSender.sendto(msgbuf, mgrp)
+	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(config["audio_mcast_interface_address"]))
+	udp_tx_thread = Thread(target=send_mcast_from_queue,args=(UDPSender,mgrp, SECONDS, config, ssrc))
+	udp_tx_thread.start()
+	udp_tx_buffer_lock = Lock()
 
-	#sequence_number = random.randint(1,9999)
-	sequence_number = 54321
-	#time_int = random.randint(1,9999)
-	time_int = 12345
+#	sequence_number = random.randint(1,9999)
+	sequence_number = 0
+	time_int = random.randint(1,9999)
+	#time_int = 12345
 	packets = 3
 
+	tfm_tx = sox.Transformer()
+	tfm_tx.set_input_format(channels=config["audio_channels"], bits=config["audio_bits"], rate=config['audio_sample_rate'], file_type='s16')
+	if ( config["audio_mcast_encoding"] == "u-law" ):
+		tfm_tx.set_output_format(rate=8000, bits=8, channels=1, encoding="u-law" )
+	elif ( config["audio_mcast_encoding"] == "a-law" ):
+		tfm_tx.set_output_format(rate=8000, bits=8, channels=1, encoding="a-law" )
+
+	tfm_rx = sox.Transformer()
+	if ( config["audio_mcast_encoding"] == "u-law" ):
+		tfm_rx.set_input_format(channels=1, bits=8, encoding="u-law", file_type="ul" )
+	elif ( config["audio_mcast_encoding"] == "a-law" ):
+		tfm_rx.set_input_format(channels=1, bits=8, encoding="a-law", file_type="al")
+		
+	tfm_rx.set_output_format(rate=config['audio_sample_rate'], bits=config["audio_bits"], channels=config["audio_channels"], file_type='s16', encoding='signed-integer')
+
+	audio_thread = Thread(target=mcast_queue_to_audio, args=(tfm_rx, audio_output_stream, SECONDS, config ))
+	audio_thread.start()
+	print("Finished Initial processing ")
 	#
 	#		Loop Through looking for audio from microphone 
 	#		If it finds it, convert to g.711 and pass out into the multicast address
@@ -315,18 +426,15 @@ def main():
 			#
 			# firstly see if we have data from the microphone
 			# data is returned as PCM 16bit 16K linear 
-			data = record_chunk(config, audio_input_stream, channel=config["in_channel_config"])
-
-			# now find the audio levels 
+			data  = record_chunk(config, audio_input_stream, channel=config["in_channel_config"])
 			has_data = False
 			length_of_data = len(data)
+
 			if length_of_data > 0:
 				max_audio_level = max(abs(data))
 				has_data = True
 			else:
 				max_audio_level = 0
-				time.sleep(SECONDS)
-			
 			# if we have data and the max level is exceeded then 
 			if has_data and max_audio_level > config["audio_threshold"]: 
 				
@@ -336,36 +444,17 @@ def main():
 
 				while quiet_samples < (config["vox_silence_time"] * (1 / SECONDS)):
 
-					data2 = data.tobytes()
+					# this is signed 16bit linear PCM - needs to be 8bit unsigned PCMU
 
-					# this is linear PCM so we need convert to PCMU to send out 
-					#this converts ulaw to 16bit linear PCM 
-					data2 = audioop.lin2ulaw(data,2)
-					print(len(data2))
-					# now convert from 16000 to 8000 
-					#data2 = audioop.ratecv(data2, 2, 1, 16000, 8000, None)[0]
-					data3 = codecs.encode(data2, "hex").decode()
-
-					packets = packets - 1
-					time_int = time_int + 1
-					sequence_number = sequence_number + 1
-
-					# now create RTP Header 
-					packet_vars = {'version' : 2, 'padding' : 0, 'extension' : 0, 'csi_count' : 0, 'marker' : 0, 'payload_type' : 0, 'sequence_number' : sequence_number, 'timestamp' : time_int, 'ssrc' : 185755418, 'payload' :  data3 }
-					header_hex = pyrtp.GenerateRTPpacket(packet_vars)
-
-					try:
-						#######################################################################
-						#nbytes = zello_ws.send_binary(send_data)
-						if (max_audio_level > 0 ):
-							UDPSender.sendto(bytes.fromhex(header_hex), mgrp)
-						#######################################################################
-					except Exception as ex:
-						print(f" A01 error {ex}")
-						break
+					datax = tfm_tx.build_array(input_array=data, sample_rate_in=config["audio_sample_rate"])
+					
+					# sample_rate = 8000, bits = 8, channels = 1, encoding = u-law
+					data4 = codecs.encode(datax, "hex").decode()
+					mcast_sender_queue.put(data4)
 					
 					# keep getting data from audio input 
 					data = record_chunk(config, audio_input_stream, channel=config["in_channel_config"])
+					
 					if len(data) > 0:
 						max_audio_level = max(abs(data))
 					else:
@@ -377,18 +466,21 @@ def main():
 					else:
 						quiet_samples = 0
 
-			#
-			# `Monitor channel for incoming traffic from the multicast 
-			else: 
-				try:
-					get_udp_audio_mcast(config,SECONDS)
-				except Exception as ex:
-					pass
+
 		except KeyboardInterrupt:
 			LOG.error("keyboard interrupt caught")
 			processing = False
 
 	LOG.info("terminating")
+
+	"""
+	print("finish up recordings")
+	file = open("samplesound.wav", "wb")
+	for j in frames:
+		file.write(j)
+	file.close()	
+	print("----")
+	"""
 	audio_input_stream.close()
 	audio_output_stream.close()
 	p.terminate()
