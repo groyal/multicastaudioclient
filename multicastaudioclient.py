@@ -336,11 +336,7 @@ def main():
 	# 
 	mgrp = (config["mcast_address"] ,config["mcast_port"])
 	mcast_sender_queue = queue.Queue()
-	
-	UDPSender = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP, fileno=None)
-	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(config["audio_mcast_interface_address"]))
-	
+
 	# changed it here UDPSender -> UDPSock 
 	udp_tx_thread = Thread(target=send_mcast_from_queue,args=(UDPSock, mgrp, SECONDS, config, ssrc))
 	udp_tx_thread.start()
@@ -424,7 +420,6 @@ def main():
 	p.terminate()
 	time.sleep(1)
 	UDPSock.close()
-	UDPSender.close()
 
 if __name__ == "__main__":
 
