@@ -317,7 +317,7 @@ def main():
 	
 	UDPSender = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP, fileno=None)
 	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton("192.168.151.122"))
+	UDPSender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton("192.168.210.124"))
 	# Transmit the datagram in the buffer
 	#UDPSender.sendto(msgbuf, mgrp)
 
