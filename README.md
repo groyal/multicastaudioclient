@@ -1,7 +1,7 @@
 # multicastaudioclient for Linux
 Python Multicast Audio Client for Linux and pulse audio
 
-This is a python multicast client that supports TX/TX multicast RTP traffic. It was developed using Ubuntu 22.04 and uses portaudio. 
+This is a python multicast client that supports TX/TX multicast RTP traffic. It was developed using Ubuntu 22.04 and uses pulse audio audio devices. 
 
 * Sends Linear PCM 16bit 48000 audio from microphone device and sends PCMU out to multicast devices (eg Yealink T27G VOIP Phone)
 * Recieves PCMU 8bit 8K traffic from multicast address and converts into PCM Linear 16bit 48K audio for playback to speaker device. 
