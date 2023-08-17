@@ -1,5 +1,5 @@
-# multicastaudioclient
-Python Multicast Audio Client for Linux portaudio
+# multicastaudioclient for Linux
+Python Multicast Audio Client for Linux and pulse audio
 
 This is a python multicast client that supports TX/TX multicast RTP traffic. It was developed using Ubuntu 22.04 and uses portaudio. 
 
